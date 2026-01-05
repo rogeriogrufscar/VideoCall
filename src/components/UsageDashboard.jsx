@@ -15,7 +15,7 @@ const UsageDashboard = () => {
       .catch(err => console.error("Erro ao carregar stats:", err));
   }, []);
 
-  const percentage = Math.min((stats.consumed / stats.limit) * 100, 100).toFixed(1);
+  const percentage = Math.min((stats.consumed / stats.limit) * 100, 100).toFixed(2);
 
   // Define a cor da barra com base no consumo
   const getBarColor = () => {

@@ -7,33 +7,29 @@ const { Pool } = require('pg');
 
 const app = express();
 
-// Middlewares
+// --- MIDDLEWARES ---
 app.use(express.json());
 app.use(cors());
 
-// Conexão com o Banco (Supabase/PostgreSQL)
+// --- CONEXÃO COM O BANCO (SUPABASE) ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// Diagnóstico de inicialização
-console.log("--- CONFIGURAÇÃO DO SERVIDOR ---");
-console.log("DATABASE_URL:", process.env.DATABASE_URL ? "✅ CONECTADO" : "❌ FALTANDO");
-console.log("DAILY_API_KEY:", process.env.DAILY_API_KEY ? "✅ CONFIGURADA" : "❌ FALTANDO");
-console.log("--------------------------------");
+// Diagnóstico de inicialização no log do Render
+console.log("--- 🚀 INICIALIZANDO BACKEND ---");
+console.log("Conexão Supabase:", process.env.DATABASE_URL ? "✅ OK" : "❌ FALTANDO");
+console.log("Daily API Key:", process.env.DAILY_API_KEY ? "✅ OK" : "❌ FALTANDO");
 
-/**
- * ROTA: Criar Reunião
- * Alterada para /create-room para coincidir com o Frontend
- */
+// --- ROTA: CRIAR REUNIÃO ---
 app.post('/create-room', async (req, res) => {
-  const { startTime, durationMinutes = 30 } = req.body || {}; // Alterado para 30 minutos
-  const monthYear = new Date().toISOString().slice(0, 7); 
+  const { durationMinutes = 30 } = req.body || {};
+  const monthYear = new Date().toISOString().slice(0, 7); // Ex: "2026-01"
   const LIMITE_SEGURANCA = 9500;
 
   try {
-    // 1. Verificar uso atual no banco de dados
+    // 1. Verificar uso atual
     const statsRes = await pool.query(
       'SELECT total_minutes_consumed FROM monthly_stats WHERE month_year = $1',
       [monthYear]
@@ -43,27 +39,21 @@ app.post('/create-room', async (req, res) => {
       ? parseFloat(statsRes.rows[0].total_minutes_consumed) 
       : 0;
 
-    console.log(`[Verificação] Mês: ${monthYear} | Uso: ${minutosConsumidos.toFixed(2)} min`);
-
     // 2. Trava de segurança
     if (minutosConsumidos >= LIMITE_SEGURANCA) {
-      console.log("🚫 Bloqueio: Limite de 9.500 minutos atingido.");
-      return res.status(403).json({ error: 'Limite mensal de minutos atingido.' });
+      console.log(`🚫 BLOQUEIO: Limite atingido (${minutosConsumidos} min)`);
+      return res.status(403).json({ error: 'Limite mensal atingido.' });
     }
 
-    // 3. Configurar tempo de expiração da sala
-    const agora = Math.floor(Date.now() / 1000);
-    const nbf = startTime ? Math.floor(new Date(startTime).getTime() / 1000) : agora;
-    const exp = nbf + (durationMinutes * 60);
-
-    // 4. Criar sala na Daily.co
-// Dentro de app.post('/create-room')
+    // 3. Criar sala na Daily.co
+    const exp = Math.floor(Date.now() / 1000) + (durationMinutes * 60);
+    
     const roomRes = await axios.post('https://api.daily.co/v1/rooms', {
-      privacy: 'public', // ✅ Mude para cá (fora de properties)
+      privacy: 'public',
       properties: { 
         enable_chat: true,
-        lang: 'pt'
-        // Se quiser usar nbf ou exp, eles ficam aqui dentro
+        lang: 'pt',
+        exp: exp 
       }
     }, { 
       headers: { 
@@ -72,57 +62,63 @@ app.post('/create-room', async (req, res) => {
       } 
     });
 
-    console.log(`✅ Sala criada: ${roomRes.data.url}`);
+    console.log(`✅ Sala criada com sucesso: ${roomRes.data.url}`);
     res.json({ url: roomRes.data.url });
 
   } catch (error) {
     console.error('❌ Erro ao criar sala:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Erro interno ao gerar sala de reunião' });
+    res.status(500).json({ error: 'Erro ao gerar sala de reunião' });
   }
 });
 
-/**
- * ROTA: Webhook da Daily
- * Recebe o evento de fim de reunião e atualiza o banco
- */
+// --- ROTA: WEBHOOK DA DAILY ---
 app.post('/webhooks/daily', async (req, res) => {
+  // Log crucial para debug em tempo real no Render
+  console.log("🔔 [WEBHOOK RECEBIDO]:", JSON.stringify(req.body));
+
   const { event, payload } = req.body;
 
   if (event === 'meeting.ended') {
-    const roomName = payload.room;
-    const durationSeconds = payload.duration;
+    const durationSeconds = payload.duration || 0;
     const minutesUsed = durationSeconds / 60;
     const monthYear = new Date().toISOString().slice(0, 7);
+    const sessionId = payload.meeting_id || 'sem-id';
 
     try {
-      // Registrar log individual
-      await pool.query(
-        `INSERT INTO usage_logs (duration_seconds, daily_session_id) 
-         VALUES ($1, $2)`,
-        [durationSeconds, payload.meeting_id]
-      );
+      // 1. Tentar gravar log individual (com try/catch isolado)
+      try {
+        await pool.query(
+          `INSERT INTO usage_logs (duration_seconds, daily_session_id) VALUES ($1, $2)`,
+          [durationSeconds, sessionId]
+        );
+      } catch (logErr) {
+        console.warn('⚠️ Aviso: Falha ao inserir usage_log (Verifique se a tabela existe):', logErr.message);
+      }
 
-      // Atualizar estatística mensal (Upsert)
-      await pool.query(
+      // 2. Atualizar estatística mensal (Upsert)
+      const updateRes = await pool.query(
         `INSERT INTO monthly_stats (month_year, total_minutes_consumed)
          VALUES ($1, $2)
          ON CONFLICT (month_year) 
-         DO UPDATE SET total_minutes_consumed = monthly_stats.total_minutes_consumed + $2,
-                       last_updated = NOW()`,
+         DO UPDATE SET 
+            total_minutes_consumed = monthly_stats.total_minutes_consumed + $2,
+            last_updated = NOW()
+         RETURNING total_minutes_consumed`,
         [monthYear, minutesUsed]
       );
       
-      console.log(`📈 [Webhook] +${minutesUsed.toFixed(2)} min registrados para ${monthYear}`);
+      console.log(`📈 [SUCESSO] +${minutesUsed.toFixed(2)} min registrados. Novo total: ${updateRes.rows[0].total_minutes_consumed}`);
+
     } catch (err) {
-      console.error('❌ [Webhook Error]:', err.message);
+      console.error('❌ [ERRO NO BANCO]:', err.message);
     }
   }
+
+  // Sempre responder 200 para a Daily não ficar tentando reenviar
   res.status(200).json({ received: true });
 });
 
-/**
- * ROTA: Estatísticas (Dashboard)
- */
+// --- ROTA: ESTATÍSTICAS (DASHBOARD) ---
 app.get('/usage-stats', async (req, res) => {
   const monthYear = new Date().toISOString().slice(0, 7);
   try {
@@ -133,12 +129,13 @@ app.get('/usage-stats', async (req, res) => {
     const consumed = result.rows.length > 0 ? parseFloat(result.rows[0].total_minutes_consumed) : 0;
     res.json({ consumed, limit: 10000 });
   } catch (err) {
+    console.error('❌ Erro ao buscar stats:', err.message);
     res.status(500).json({ error: 'Erro ao buscar estatísticas' });
   }
 });
 
-// Inicialização
+// --- INICIALIZAÇÃO ---
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor backend rodando em http://localhost:${PORT}`);
+  console.log(`🚀 Servidor rodando na porta ${PORT}`);
 });

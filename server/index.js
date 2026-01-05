@@ -73,29 +73,36 @@ app.post('/create-room', async (req, res) => {
 
 // --- ROTA: WEBHOOK DA DAILY ---
 app.post('/webhooks/daily', async (req, res) => {
-  // Log crucial para debug em tempo real no Render
   console.log("🔔 [WEBHOOK RECEBIDO]:", JSON.stringify(req.body));
 
-  const { event, payload } = req.body;
+  // 1. Ajuste: A Daily pode mandar 'type' ou 'event'
+  const eventType = req.body.type || req.body.event;
+  const payload = req.body.payload;
 
-  if (event === 'meeting.ended') {
-    const durationSeconds = payload.duration || 0;
+  if (eventType === 'meeting.ended') {
+    // 2. Ajuste: Calcular duração (fim - início) caso o campo 'duration' não venha pronto
+    const start = payload.start_ts;
+    const end = payload.end_ts;
+    const durationSeconds = payload.duration || (end - start) || 0;
+    
     const minutesUsed = durationSeconds / 60;
     const monthYear = new Date().toISOString().slice(0, 7);
     const sessionId = payload.meeting_id || 'sem-id';
 
+    console.log(`⏱️ Calculado: ${durationSeconds.toFixed(2)}s (${minutesUsed.toFixed(2)} min)`);
+
     try {
-      // 1. Tentar gravar log individual (com try/catch isolado)
+      // Registrar log individual
       try {
         await pool.query(
           `INSERT INTO usage_logs (duration_seconds, daily_session_id) VALUES ($1, $2)`,
           [durationSeconds, sessionId]
         );
       } catch (logErr) {
-        console.warn('⚠️ Aviso: Falha ao inserir usage_log (Verifique se a tabela existe):', logErr.message);
+        console.warn('⚠️ Falha ao inserir usage_log:', logErr.message);
       }
 
-      // 2. Atualizar estatística mensal (Upsert)
+      // Atualizar estatística mensal
       const updateRes = await pool.query(
         `INSERT INTO monthly_stats (month_year, total_minutes_consumed)
          VALUES ($1, $2)
@@ -114,7 +121,6 @@ app.post('/webhooks/daily', async (req, res) => {
     }
   }
 
-  // Sempre responder 200 para a Daily não ficar tentando reenviar
   res.status(200).json({ received: true });
 });
 
